@@ -248,6 +248,7 @@ func g() { fmt.Println(test.Foo(3)) }
 				},
 			},
 			wantErr: false,
+			// TODO(suzmue): fix this test to expect it to remove duplicates, the 2 packages include test variant.
 			wantOut: "Renamed 2 occurrences in 2 files in 2 packages.",
 		},
 	} {
@@ -277,7 +278,7 @@ func g() { fmt.Println(test.Foo(3)) }
 		cmd := exec.Command(bin, args...)
 		cmd.Args[0] = "gorename"
 		cmd.Env = env
-
+		cmd.Dir = srcDir
 		// Check the output
 		out, err := cmd.CombinedOutput()
 		// errors should result in no changes to files

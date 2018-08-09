@@ -14,7 +14,6 @@ import (
 	"go/ast"
 	"go/build"
 	"go/format"
-	"go/parser"
 	"go/token"
 	"go/types"
 	"io"
@@ -22,15 +21,11 @@ import (
 	"log"
 	"os"
 	"os/exec"
-	"path"
+	"path/filepath"
 	"regexp"
-	"sort"
-	"strconv"
-	"strings"
 
-	"golang.org/x/tools/go/loader"
+	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/types/typeutil"
-	"golang.org/x/tools/refactor/importgraph"
 	"golang.org/x/tools/refactor/satisfy"
 )
 
@@ -159,12 +154,13 @@ var (
 var stdout io.Writer = os.Stdout
 
 type renamer struct {
-	iprog              *loader.Program
+	iprog              []*packages.Package
+	Fset               *token.FileSet
 	objsToUpdate       map[types.Object]bool
 	hadConflicts       bool
 	from, to           string
 	satisfyConstraints map[satisfy.Constraint]bool
-	packages           map[*types.Package]*loader.PackageInfo // subset of iprog.AllPackages to inspect
+	packages           map[*types.Package]*packages.Package // subset of iprog.AllPackages to inspect
 	msets              typeutil.MethodSetCache
 	changeMethods      bool
 }
@@ -173,51 +169,8 @@ var reportError = func(posn token.Position, message string) {
 	fmt.Fprintf(os.Stderr, "%s: %s\n", posn, message)
 }
 
-// importName renames imports of fromPath within the package specified by info.
-// If fromName is not empty, importName renames only imports as fromName.
-// If the renaming would lead to a conflict, the file is left unchanged.
-func importName(iprog *loader.Program, info *loader.PackageInfo, fromPath, fromName, to string) error {
-	if fromName == to {
-		return nil // no-op (e.g. rename x/foo to y/foo)
-	}
-	for _, f := range info.Files {
-		var from types.Object
-		for _, imp := range f.Imports {
-			importPath, _ := strconv.Unquote(imp.Path.Value)
-			importName := path.Base(importPath)
-			if imp.Name != nil {
-				importName = imp.Name.Name
-			}
-			if importPath == fromPath && (fromName == "" || importName == fromName) {
-				from = info.Implicits[imp]
-				break
-			}
-		}
-		if from == nil {
-			continue
-		}
-		r := renamer{
-			iprog:        iprog,
-			objsToUpdate: make(map[types.Object]bool),
-			to:           to,
-			packages:     map[*types.Package]*loader.PackageInfo{info.Pkg: info},
-		}
-		r.check(from)
-		if r.hadConflicts {
-			reportError(iprog.Fset.Position(f.Imports[0].Pos()),
-				"skipping update of this file")
-			continue // ignore errors; leave the existing name
-		}
-		if err := r.update(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func Main(ctxt *build.Context, offsetFlag, fromFlag, to string) error {
 	// -- Parse the -from or -offset specifier ----------------------------
-
 	if (offsetFlag == "") == (fromFlag == "") {
 		return fmt.Errorf("exactly one of the -from and -offset flags must be specified")
 	}
@@ -234,9 +187,9 @@ func Main(ctxt *build.Context, offsetFlag, fromFlag, to string) error {
 	var spec *spec
 	var err error
 	if fromFlag != "" {
-		spec, err = parseFromFlag(ctxt, fromFlag)
+		spec, err = parseFromFlag(fromFlag)
 	} else {
-		spec, err = parseOffsetFlag(ctxt, offsetFlag)
+		spec, err = parseOffsetFlag(offsetFlag)
 	}
 	if err != nil {
 		return err
@@ -248,74 +201,71 @@ func Main(ctxt *build.Context, offsetFlag, fromFlag, to string) error {
 
 	// -- Load the program consisting of the initial package  -------------
 
-	iprog, err := loadProgram(ctxt, map[string]bool{spec.pkg: true})
+	pkgs, err := getPackages(spec)
+	if err != nil {
+		return err
+	}
+	if len(pkgs) == 0 {
+		return fmt.Errorf("package not loaded: %v", spec)
+	}
+
+	fromObjects, err := findFromObjects(pkgs, spec)
 	if err != nil {
 		return err
 	}
 
-	fromObjects, err := findFromObjects(iprog, spec)
-	if err != nil {
-		return err
-	}
-
-	// -- Load a larger program, for global renamings ---------------------
-
+	// -- global renamings ---------------------
+	// TODO(suzmue): deal with global renames
+	var importedPkgs []*packages.Package
 	if requiresGlobalRename(fromObjects, to) {
 		// For a local refactoring, we needn't load more
 		// packages, but if the renaming affects the package's
-		// API, we we must load all packages that depend on the
-		// package defining the object, plus their tests.
+		// API, we must change the version of our package.  We
+		// do not rename variables in other packages.
 
-		if Verbose {
-			log.Print("Potentially global renaming; scanning workspace...")
-		}
-
+		// TODO(suzmue): Get local reverse transitive closure or allow
+		// users to pass in other packages.  Create a helper function to allow
+		// users to update to this new API (should be able to work on packages using a
+		// local version).
 		// Scan the workspace and build the import graph.
-		_, rev, errors := importgraph.Build(ctxt)
-		if len(errors) > 0 {
-			// With a large GOPATH tree, errors are inevitable.
-			// Report them but proceed.
-			fmt.Fprintf(os.Stderr, "While scanning Go workspace:\n")
-			for path, err := range errors {
-				fmt.Fprintf(os.Stderr, "Package %q: %s.\n", path, err)
-			}
-		}
+		fmt.Println("This renaming renames an exported variable, you may need to release a new version of a package")
 
-		// Enumerate the set of potentially affected packages.
-		affectedPackages := make(map[string]bool)
+		// This may have come from an imported package.  Add those.
 		for _, obj := range fromObjects {
-			// External test packages are never imported,
-			// so they will never appear in the graph.
-			for path := range rev.Search(obj.Pkg().Path()) {
-				affectedPackages[path] = true
+			found := false
+			for _, pkg := range pkgs {
+				if obj.Pkg() == pkg.Types {
+					found = true
+					break
+				}
+			}
+			if found {
+				continue
+			}
+			return fmt.Errorf("cannot rename identifier from another package.")
+		}
+		for _, pkg := range pkgs {
+			for _, imp := range pkg.Imports {
+				importedPkgs = append(importedPkgs, imp)
 			}
 		}
 
-		// TODO(adonovan): allow the user to specify the scope,
-		// or -ignore patterns?  Computing the scope when we
-		// don't (yet) support inputs containing errors can make
-		// the tool rather brittle.
+		// Reject renaming in other packages.
 
-		// Re-load the larger program.
-		iprog, err = loadProgram(ctxt, affectedPackages)
-		if err != nil {
-			return err
-		}
+		// TODO(suzmue): Load the reverse transitive closure of the package.
+		// In vgo, his would only include packages with a replace to the specific local copy.
 
-		fromObjects, err = findFromObjects(iprog, spec)
-		if err != nil {
-			return err
-		}
 	}
 
 	// -- Do the renaming -------------------------------------------------
 
 	r := renamer{
-		iprog:        iprog,
+		iprog:        pkgs,
 		objsToUpdate: make(map[types.Object]bool),
 		from:         spec.fromName,
 		to:           to,
-		packages:     make(map[*types.Package]*loader.PackageInfo),
+		packages:     make(map[*types.Package]*packages.Package),
+		Fset:         pkgs[0].Fset,
 	}
 
 	// A renaming initiated at an interface method indicates the
@@ -331,87 +281,39 @@ func Main(ctxt *build.Context, offsetFlag, fromFlag, to string) error {
 		}
 	}
 
-	// Only the initially imported packages (iprog.Imported) and
-	// their external tests (iprog.Created) should be inspected or
-	// modified, as only they have type-checked functions bodies.
-	// The rest are just dependencies, needed only for package-level
-	// type information.
-	for _, info := range iprog.Imported {
-		r.packages[info.Pkg] = info
+	for _, pkg := range pkgs {
+		r.packages[pkg.Types] = pkg
 	}
-	for _, info := range iprog.Created { // (tests)
-		r.packages[info.Pkg] = info
+	for _, pkg := range importedPkgs {
+		r.packages[pkg.Types] = pkg
 	}
 
 	for _, from := range fromObjects {
 		r.check(from)
 	}
+
 	if r.hadConflicts && !Force {
 		return ConflictError
 	}
 	return r.update()
 }
 
-// loadProgram loads the specified set of packages (plus their tests)
-// and all their dependencies, from source, through the specified build
-// context.  Only packages in pkgs will have their functions bodies typechecked.
-func loadProgram(ctxt *build.Context, pkgs map[string]bool) (*loader.Program, error) {
-	conf := loader.Config{
-		Build:      ctxt,
-		ParserMode: parser.ParseComments,
-
-		// TODO(adonovan): enable this.  Requires making a lot of code more robust!
-		AllowErrors: false,
-	}
-	// Optimization: don't type-check the bodies of functions in our
-	// dependencies, since we only need exported package members.
-	conf.TypeCheckFuncBodies = func(p string) bool {
-		return pkgs[p] || pkgs[strings.TrimSuffix(p, "_test")]
+func getPackages(spec *spec) ([]*packages.Package, error) {
+	var arg = spec.pkg
+	dir, _ := os.Getwd()
+	if spec.filename != "" {
+		// Import directory.
+		dir = filepath.Dir(spec.filename)
+		arg = "."
 	}
 
-	if Verbose {
-		var list []string
-		for pkg := range pkgs {
-			list = append(list, pkg)
-		}
-		sort.Strings(list)
-		for _, pkg := range list {
-			log.Printf("Loading package: %s", pkg)
-		}
+	opts := &packages.Config{
+		Tests: true,
+		Dir:   dir,
+		Mode:  packages.LoadAllSyntax,
 	}
-
-	for pkg := range pkgs {
-		conf.ImportWithTests(pkg)
-	}
-
-	// Ideally we would just return conf.Load() here, but go/types
-	// reports certain "soft" errors that gc does not (Go issue 14596).
-	// As a workaround, we set AllowErrors=true and then duplicate
-	// the loader's error checking but allow soft errors.
-	// It would be nice if the loader API permitted "AllowErrors: soft".
-	conf.AllowErrors = true
-	prog, err := conf.Load()
-	if err != nil {
-		return nil, err
-	}
-
-	var errpkgs []string
-	// Report hard errors in indirectly imported packages.
-	for _, info := range prog.AllPackages {
-		if containsHardErrors(info.Errors) {
-			errpkgs = append(errpkgs, info.Pkg.Path())
-		}
-	}
-	if errpkgs != nil {
-		var more string
-		if len(errpkgs) > 3 {
-			more = fmt.Sprintf(" and %d more", len(errpkgs)-3)
-			errpkgs = errpkgs[:3]
-		}
-		return nil, fmt.Errorf("couldn't load packages due to errors: %s%s",
-			strings.Join(errpkgs, ", "), more)
-	}
-	return prog, nil
+	pkgs, err := packages.Load(opts, arg)
+	return pkgs, err
 }
 
 func containsHardErrors(errors []error) bool {
@@ -461,13 +363,13 @@ func (r *renamer) update() error {
 	docRegexp := regexp.MustCompile(`\b` + r.from + `\b`)
 	for _, info := range r.packages {
 		// Mutate the ASTs and note the filenames.
-		for id, obj := range info.Defs {
+		for id, obj := range info.TypesInfo.Defs {
 			if r.objsToUpdate[obj] {
 				nidents++
 				id.Name = r.to
-				filesToUpdate[r.iprog.Fset.File(id.Pos())] = true
+				filesToUpdate[r.Fset.File(id.Pos())] = true
 				// Perform the rename in doc comments too.
-				if doc := r.docComment(id); doc != nil {
+				if doc := r.docComment(info, id); doc != nil {
 					for _, comment := range doc.List {
 						comment.Text = docRegexp.ReplaceAllString(comment.Text, r.to)
 					}
@@ -475,11 +377,11 @@ func (r *renamer) update() error {
 			}
 		}
 
-		for id, obj := range info.Uses {
+		for id, obj := range info.TypesInfo.Uses {
 			if r.objsToUpdate[obj] {
 				nidents++
 				id.Name = r.to
-				filesToUpdate[r.iprog.Fset.File(id.Pos())] = true
+				filesToUpdate[r.Fset.File(id.Pos())] = true
 			}
 		}
 	}
@@ -487,14 +389,14 @@ func (r *renamer) update() error {
 	// Renaming not supported if cgo files are affected.
 	var generatedFileNames []string
 	for _, info := range r.packages {
-		for _, f := range info.Files {
-			tokenFile := r.iprog.Fset.File(f.Pos())
+		for _, f := range info.Syntax {
+			tokenFile := r.Fset.File(f.Pos())
 			if filesToUpdate[tokenFile] && generated(f, tokenFile) {
 				generatedFileNames = append(generatedFileNames, tokenFile.Name())
 			}
 		}
 	}
-	if !Force && len(generatedFileNames) > 0 {
+	if len(generatedFileNames) > 0 {
 		return fmt.Errorf("refusing to modify generated file%s containing DO NOT EDIT marker: %v", plural(len(generatedFileNames)), generatedFileNames)
 	}
 
@@ -502,20 +404,20 @@ func (r *renamer) update() error {
 	var nerrs, npkgs int
 	for _, info := range r.packages {
 		first := true
-		for _, f := range info.Files {
-			tokenFile := r.iprog.Fset.File(f.Pos())
+		for _, f := range info.Syntax {
+			tokenFile := r.Fset.File(f.Pos())
 			if filesToUpdate[tokenFile] {
 				if first {
 					npkgs++
 					first = false
 					if Verbose {
-						log.Printf("Updating package %s", info.Pkg.Path())
+						log.Printf("Updating package %s", info.Types.Path())
 					}
 				}
 
 				filename := tokenFile.Name()
 				var buf bytes.Buffer
-				if err := format.Node(&buf, r.iprog.Fset, f); err != nil {
+				if err := format.Node(&buf, r.Fset, f); err != nil {
 					log.Printf("failed to pretty-print syntax tree: %v", err)
 					nerrs++
 					continue
@@ -540,8 +442,8 @@ func (r *renamer) update() error {
 }
 
 // docComment returns the doc for an identifier.
-func (r *renamer) docComment(id *ast.Ident) *ast.CommentGroup {
-	_, nodes, _ := r.iprog.PathEnclosingInterval(id.Pos(), id.End())
+func (r *renamer) docComment(pkg *packages.Package, id *ast.Ident) *ast.CommentGroup {
+	_, nodes, _ := pathEnclosingInterval(pkg, id.Pos(), id.End())
 	for _, node := range nodes {
 		switch decl := node.(type) {
 		case *ast.FuncDecl:

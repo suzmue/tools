@@ -12,14 +12,14 @@ import (
 	"go/token"
 	"go/types"
 
-	"golang.org/x/tools/go/loader"
+	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/refactor/satisfy"
 )
 
 // errorf reports an error (e.g. conflict) and prevents file modification.
 func (r *renamer) errorf(pos token.Pos, format string, args ...interface{}) {
 	r.hadConflicts = true
-	reportError(r.iprog.Fset.Position(pos), fmt.Sprintf(format, args...))
+	reportError(r.Fset.Position(pos), fmt.Sprintf(format, args...))
 }
 
 // check performs safety checks of the renaming of the 'from' object to r.to.
@@ -69,7 +69,8 @@ func (r *renamer) checkInFileBlock(from *types.PkgName) {
 	r.checkInLexicalScope(from, r.packages[from.Pkg()])
 
 	// Finally, modify ImportSpec syntax to add or remove the Name as needed.
-	info, path, _ := r.iprog.PathEnclosingInterval(from.Pos(), from.Pos())
+	info, path, _ := pathEnclosingInterval(r.packages[from.Pkg()], from.Pos(), from.Pos())
+
 	if from.Imported().Name() == r.to {
 		// ImportSpec.Name not needed
 		path[1].(*ast.ImportSpec).Name = nil
@@ -77,7 +78,7 @@ func (r *renamer) checkInFileBlock(from *types.PkgName) {
 		// ImportSpec.Name needed
 		if spec := path[1].(*ast.ImportSpec); spec.Name == nil {
 			spec.Name = &ast.Ident{NamePos: spec.Path.Pos(), Name: r.to}
-			info.Defs[spec.Name] = from
+			info.TypesInfo.Defs[spec.Name] = from
 		}
 	}
 }
@@ -92,6 +93,7 @@ func (r *renamer) checkInPackageBlock(from types.Object) {
 			if pkg == from.Pkg() {
 				continue
 			}
+
 			if id := someUse(info, from); id != nil &&
 				!r.checkExport(id, pkg, from) {
 				break
@@ -106,7 +108,7 @@ func (r *renamer) checkInPackageBlock(from types.Object) {
 		kind := objectKind(from)
 		if kind == "func" {
 			// Reject if intra-package references to it exist.
-			for id, obj := range info.Uses {
+			for id, obj := range info.TypesInfo.Uses {
 				if obj == from {
 					r.errorf(from.Pos(),
 						"renaming this func %q to %q would make it a package initializer",
@@ -122,8 +124,8 @@ func (r *renamer) checkInPackageBlock(from types.Object) {
 	}
 
 	// Check for conflicts between package block and all file blocks.
-	for _, f := range info.Files {
-		fileScope := info.Info.Scopes[f]
+	for _, f := range info.Syntax {
+		fileScope := info.TypesInfo.Scopes[f]
 		b, prev := fileScope.LookupParent(r.to, token.NoPos)
 		if b == fileScope {
 			r.errorf(from.Pos(), "renaming this %s %q to %q would conflict",
@@ -157,7 +159,7 @@ func (r *renamer) checkInLocalScope(from types.Object) {
 	//   }
 	//
 	var isCaseVar bool
-	for syntax, obj := range info.Implicits {
+	for syntax, obj := range info.TypesInfo.Implicits {
 		if _, ok := syntax.(*ast.CaseClause); ok && obj.Pos() == from.Pos() {
 			isCaseVar = true
 			r.check(obj)
@@ -168,7 +170,8 @@ func (r *renamer) checkInLocalScope(from types.Object) {
 
 	// Finally, if this was a type switch, change the variable y.
 	if isCaseVar {
-		_, path, _ := r.iprog.PathEnclosingInterval(from.Pos(), from.Pos())
+		// TODO(suzmue): FIX THIS
+		_, path, _ := pathEnclosingInterval(info, from.Pos(), from.Pos())
 		path[0].(*ast.Ident).Name = r.to // path is [Ident AssignStmt TypeSwitchStmt...]
 	}
 }
@@ -207,7 +210,7 @@ func (r *renamer) checkInLocalScope(from types.Object) {
 // Removing the old name (and all references to it) is always safe, and
 // requires no checks.
 //
-func (r *renamer) checkInLexicalScope(from types.Object, info *loader.PackageInfo) {
+func (r *renamer) checkInLexicalScope(from types.Object, info *packages.Package) {
 	b := from.Parent() // the block defining the 'from' object
 	if b != nil {
 		toBlock, to := b.LookupParent(r.to, from.Parent().End())
@@ -249,6 +252,7 @@ func (r *renamer) checkInLexicalScope(from types.Object, info *loader.PackageInf
 		// See what r.to would resolve to in the same scope.
 		toBlock, to := lexicalLookup(block, r.to, id.Pos())
 		if to != nil {
+			// TODO(suzmue): be more specific if in same block.
 			// sub-block conflict
 			if deeper(toBlock, fromBlock) {
 				r.errorf(from.Pos(), "renaming this %s %q to %q",
@@ -268,9 +272,9 @@ func (r *renamer) checkInLexicalScope(from types.Object, info *loader.PackageInf
 	// 	var s struct {T}
 	// 	print(s.T) // ...this must change too
 	if _, ok := from.(*types.TypeName); ok {
-		for id, obj := range info.Uses {
+		for id, obj := range info.TypesInfo.Uses {
 			if obj == from {
-				if field := info.Defs[id]; field != nil {
+				if field := info.TypesInfo.Defs[id]; field != nil {
 					r.check(field)
 				}
 			}
@@ -310,7 +314,7 @@ func deeper(x, y *types.Scope) bool {
 // info that is a reference to obj in lexical scope.  block is the
 // lexical block enclosing the reference.  If fn returns false the
 // iteration is terminated and findLexicalRefs returns false.
-func forEachLexicalRef(info *loader.PackageInfo, obj types.Object, fn func(id *ast.Ident, block *types.Scope) bool) bool {
+func forEachLexicalRef(info *packages.Package, obj types.Object, fn func(id *ast.Ident, block *types.Scope) bool) bool {
 	ok := true
 	var stack []ast.Node
 
@@ -327,8 +331,8 @@ func forEachLexicalRef(info *loader.PackageInfo, obj types.Object, fn func(id *a
 		stack = append(stack, n) // push
 		switch n := n.(type) {
 		case *ast.Ident:
-			if info.Uses[n] == obj {
-				block := enclosingBlock(&info.Info, stack)
+			if info.TypesInfo.Uses[n] == obj {
+				block := enclosingBlock(info.TypesInfo, stack)
 				if !fn(n, block) {
 					ok = false
 				}
@@ -343,7 +347,7 @@ func forEachLexicalRef(info *loader.PackageInfo, obj types.Object, fn func(id *a
 		case *ast.CompositeLit:
 			// Handle recursion ourselves for struct literals
 			// so we don't visit field identifiers.
-			tv := info.Types[n]
+			tv := info.TypesInfo.Types[n]
 			if _, ok := deref(tv.Type).Underlying().(*types.Struct); ok {
 				if n.Type != nil {
 					ast.Inspect(n.Type, visit)
@@ -361,7 +365,7 @@ func forEachLexicalRef(info *loader.PackageInfo, obj types.Object, fn func(id *a
 		return true
 	}
 
-	for _, f := range info.Files {
+	for _, f := range info.Syntax {
 		ast.Inspect(f, visit)
 		if len(stack) != 0 {
 			panic(stack)
@@ -413,7 +417,8 @@ func (r *renamer) checkStructField(from *types.Var) {
 	// go/types offers no easy way to get from a field (or interface
 	// method) to its declaring struct (or interface), so we must
 	// ascend the AST.
-	info, path, _ := r.iprog.PathEnclosingInterval(from.Pos(), from.Pos())
+	info, path, _ := pathEnclosingInterval(r.packages[from.Pkg()], from.Pos(), from.Pos())
+
 	// path matches this pattern:
 	// [Ident SelectorExpr? StarExpr? Field FieldList StructType ParenExpr* ... File]
 
@@ -440,8 +445,8 @@ func (r *renamer) checkStructField(from *types.Var) {
 		// This struct is also a named type.
 		// We must check for direct (non-promoted) field/field
 		// and method/field conflicts.
-		named := info.Defs[spec.Name].Type()
-		prev, indices, _ := types.LookupFieldOrMethod(named, true, info.Pkg, r.to)
+		named := info.TypesInfo.Defs[spec.Name].Type()
+		prev, indices, _ := types.LookupFieldOrMethod(named, true, info.Types, r.to)
 		if len(indices) == 1 {
 			r.errorf(from.Pos(), "renaming this field %q to %q",
 				from.Name(), r.to)
@@ -452,7 +457,7 @@ func (r *renamer) checkStructField(from *types.Var) {
 	} else {
 		// This struct is not a named type.
 		// We need only check for direct (non-promoted) field/field conflicts.
-		T := info.Types[tStruct].Type.Underlying().(*types.Struct)
+		T := info.TypesInfo.Types[tStruct].Type.Underlying().(*types.Struct)
 		for i := 0; i < T.NumFields(); i++ {
 			if prev := T.Field(i); prev.Name() == r.to {
 				r.errorf(from.Pos(), "renaming this field %q to %q",
@@ -489,7 +494,7 @@ func (r *renamer) checkSelections(from types.Object) {
 			}
 		}
 
-		for syntax, sel := range info.Selections {
+		for syntax, sel := range info.TypesInfo.Selections {
 			// There may be extant selections of only the old
 			// name or only the new name, so we must check both.
 			// (If neither, the renaming is sound.)
@@ -526,6 +531,7 @@ func (r *renamer) checkSelections(from types.Object) {
 				}
 
 			} else if sel.Obj().Name() == r.to {
+
 				if obj, indices, _ := types.LookupFieldOrMethod(sel.Recv(), isAddressable, from.Pkg(), from.Name()); obj == from {
 					// Renaming 'from' may cause this existing
 					// selection of the name 'to' to change
@@ -607,7 +613,7 @@ func (r *renamer) checkMethod(from *types.Func) {
 		// declaration conflicts too.
 		for _, info := range r.packages {
 			// Start with named interface types (better errors)
-			for _, obj := range info.Defs {
+			for _, obj := range info.TypesInfo.Defs {
 				if obj, ok := obj.(*types.TypeName); ok && isInterface(obj.Type()) {
 					f, _, _ := types.LookupFieldOrMethod(
 						obj.Type(), false, from.Pkg(), from.Name())
@@ -627,7 +633,7 @@ func (r *renamer) checkMethod(from *types.Func) {
 			}
 
 			// Now look at all literal interface types (includes named ones again).
-			for e, tv := range info.Types {
+			for e, tv := range info.TypesInfo.Types {
 				if e, ok := e.(*ast.InterfaceType); ok {
 					_ = e
 					_ = tv.Type.(*types.Interface)
@@ -822,7 +828,7 @@ func (r *renamer) satisfy() map[satisfy.Constraint]bool {
 		// Compute on demand: it's expensive.
 		var f satisfy.Finder
 		for _, info := range r.packages {
-			f.Find(&info.Info, info.Files)
+			f.Find(info.TypesInfo, info.Syntax)
 		}
 		r.satisfyConstraints = f.Result
 	}
@@ -837,8 +843,8 @@ func recv(meth *types.Func) *types.Var {
 }
 
 // someUse returns an arbitrary use of obj within info.
-func someUse(info *loader.PackageInfo, obj types.Object) *ast.Ident {
-	for id, o := range info.Uses {
+func someUse(info *packages.Package, obj types.Object) *ast.Ident {
+	for id, o := range info.TypesInfo.Uses {
 		if o == obj {
 			return id
 		}

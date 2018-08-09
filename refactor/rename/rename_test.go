@@ -7,16 +7,15 @@ package rename
 import (
 	"bytes"
 	"fmt"
-	"go/build"
 	"go/token"
+	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
 	"testing"
-
-	"golang.org/x/tools/go/buildutil"
 )
 
 // TODO(adonovan): test reported source positions, somehow.
@@ -28,15 +27,15 @@ func TestConflicts(t *testing.T) {
 	}(writeFile, reportError)
 	writeFile = func(string, []byte) error { return nil }
 
-	var ctxt *build.Context
-	for _, test := range []struct {
-		ctxt             *build.Context // nil => use previous
-		offset, from, to string         // values of the -offset/-from and -to flags
-		want             string         // regexp to match conflict errors, or "OK"
+	var ctxt map[string][]string
+	for i, test := range []struct {
+		ctxt             map[string][]string // nil => use previous
+		offset, from, to string              // values of the -offset/-from and -to flags
+		want             string              // regexp to match conflict errors, or "OK"
 	}{
 		// init() checks
 		{
-			ctxt: fakeContext(map[string][]string{
+			ctxt: map[string][]string{
 				"fmt": {`package fmt; type Stringer interface { String() }`},
 				"main": {`
 package main
@@ -48,7 +47,7 @@ var v foo.Stringer
 func f() { v.String(); f() }
 `,
 					`package main; var w int`},
-			}),
+			},
 			from: "main.v", to: "init",
 			want: `you cannot have a var at package level named "init"`,
 		},
@@ -63,16 +62,18 @@ func f() { v.String(); f() }
 		},
 
 		// Export checks
-		{
-			from: "fmt.Stringer", to: "stringer",
-			want: `renaming this type "Stringer" to "stringer" would make it unexported.*` +
-				`breaking references from packages such as "main"`,
-		},
-		{
-			from: "(fmt.Stringer).String", to: "string",
-			want: `renaming this method "String" to "string" would make it unexported.*` +
-				`breaking references from packages such as "main"`,
-		},
+		// TODO(suzmue): This will change the API so would be a new package version, so would need to be caught by a release tool,
+		// not in gorename.
+		// {
+		// 	from: "fmt.Stringer", to: "stringer",
+		// 	want: `renaming this type "Stringer" to "stringer" would make it unexported.*` +
+		// 		`breaking references from packages such as "main"`,
+		// },
+		// {
+		// 	from: "(fmt.Stringer).String", to: "string",
+		// 	want: `renaming this method "String" to "string" would make it unexported.*` +
+		// 		`breaking references from packages such as "main"`,
+		// },
 
 		// Lexical scope checks
 		{
@@ -100,7 +101,7 @@ func f() { v.String(); f() }
 				`with this package member var`,
 		},
 		{
-			ctxt: main(`
+			ctxt: map[string][]string{"main": {`
 package main
 
 var x, z int
@@ -114,7 +115,8 @@ func g(w int) {
 	print(x)
 	x := 1
 	print(x)
-}`),
+}`},
+			},
 			from: "main.x", to: "y",
 			want: `renaming this var "x" to "y".*` +
 				`would cause this reference to become shadowed.*` +
@@ -142,7 +144,7 @@ func g(w int) {
 
 		// Label checks
 		{
-			ctxt: main(`
+			ctxt: map[string][]string{"main": {`
 package main
 
 func f() {
@@ -155,7 +157,8 @@ bar:
 		goto wiz
 	}(0)
 }
-`),
+`},
+			},
 			from: "main.f::foo", to: "bar",
 			want: `renaming this label "foo" to "bar".*` +
 				`would conflict with this one`,
@@ -175,7 +178,7 @@ bar:
 
 		// Struct fields
 		{
-			ctxt: main(`
+			ctxt: map[string][]string{"main": {`
 package main
 
 type U struct { u int }
@@ -194,7 +197,8 @@ func f() {
 	print(w.u) // NB: there is no selection of w.v
 	var _ struct { yy, zz int }
 }
-`),
+`},
+			},
 			// field/field conflict in named struct declaration
 			from: "(main.W).U", to: "w",
 			want: `renaming this field "U" to "w".*` +
@@ -284,7 +288,7 @@ func f() {
 
 		// Methods
 		{
-			ctxt: main(`
+			ctxt: map[string][]string{"main": {`
 package main
 type C int
 func (C) f()
@@ -296,7 +300,8 @@ type I interface { f(); g() }
 type J interface { I; h() }
 var _ I = new(D)
 var _ interface {f()} = C(0)
-`),
+`},
+			},
 			from: "(main.I).f", to: "g",
 			want: `renaming this interface method "f" to "g".*` +
 				`would conflict with this method`,
@@ -327,7 +332,7 @@ var _ interface {f()} = C(0)
 			from: "(main.D).g", to: "e",
 			want: `renaming this method "g" to "e".*` +
 				`would make \*main.D no longer assignable to interface I.*` +
-				`(rename main.I.g if you intend to change both types)`,
+				`(rename *main.I.g if you intend to change both types)`,
 		},
 		{
 			from: "(main.I).f", to: "e",
@@ -335,28 +340,28 @@ var _ interface {f()} = C(0)
 		},
 		// Indirect C/I method coupling via another concrete type D.
 		{
-			ctxt: main(`
+			ctxt: map[string][]string{"main": {`
 package main
 type I interface { f() }
 type C int
 func (C) f()
 type D struct{C}
 var _ I = D{}
-`),
+`}},
 			from: "(main.C).f", to: "F",
 			want: `renaming this method "f" to "F".*` +
 				`would make main.D no longer assignable to interface I.*` +
-				`(rename main.I.f if you intend to change both types)`,
+				`(rename *main.I.f if you intend to change both types)`,
 		},
 		// Renaming causes promoted method to become shadowed; C no longer satisfies I.
 		{
-			ctxt: main(`
+			ctxt: map[string][]string{"main": {`
 package main
 type I interface { f() }
 type C struct { I }
 func (C) g() int
 var _ I = C{}
-`),
+`}},
 			from: "main.I.f", to: "g",
 			want: `renaming this method "f" to "g".*` +
 				`would change the g method of main.C invoked via interface main.I.*` +
@@ -365,7 +370,7 @@ var _ I = C{}
 		},
 		// Renaming causes promoted method to become ambiguous; C no longer satisfies I.
 		{
-			ctxt: main(`
+			ctxt: map[string][]string{"main": {`
 package main
 type I interface{f()}
 type C int
@@ -374,13 +379,14 @@ type D int
 func (D) g()
 type E struct{C;D}
 var _ I = E{}
-`),
+`}},
 			from: "main.I.f", to: "g",
 			want: `renaming this method "f" to "g".*` +
 				`would make the g method of main.E invoked via interface main.I ambiguous.*` +
 				`with \(main.D\).g`,
 		},
 	} {
+
 		var conflicts []string
 		reportError = func(posn token.Position, message string) {
 			conflicts = append(conflicts, message)
@@ -388,18 +394,28 @@ var _ I = E{}
 		if test.ctxt != nil {
 			ctxt = test.ctxt
 		}
-		err := Main(ctxt, test.offset, test.from, test.to)
+
+		_, cleanup, err := fakeContext(ctxt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.HasPrefix(test.from, "/go/src") {
+			test.from = strings.Replace(test.from, "/go/src/", "./", 1)
+		}
+
+		err = Main(nil, test.offset, test.from, test.to)
 		var prefix string
 		if test.offset == "" {
-			prefix = fmt.Sprintf("-from %q -to %q", test.from, test.to)
+			prefix = fmt.Sprintf("%d: -from %q -to %q", i, test.from, test.to)
 		} else {
-			prefix = fmt.Sprintf("-offset %q -to %q", test.offset, test.to)
+			prefix = fmt.Sprintf("%d: -offset %q -to %q", i, test.offset, test.to)
 		}
 		if err == ConflictError {
 			got := strings.Join(conflicts, "\n")
 			if false {
 				t.Logf("%s: %s", prefix, got)
 			}
+
 			pattern := "(?s:" + test.want + ")" // enable multi-line matching
 			if !regexp.MustCompile(pattern).MatchString(got) {
 				t.Errorf("%s: conflict does not match pattern:\n"+
@@ -413,16 +429,21 @@ var _ I = E{}
 			t.Errorf("%s: unexpected success, want conflicts matching:\n%s",
 				prefix, test.want)
 		}
+		cleanup()
 	}
 }
 
 func TestInvalidIdentifiers(t *testing.T) {
-	ctxt := fakeContext(map[string][]string{
+	_, cleanup, err := fakeContext(map[string][]string{
 		"main": {`
 package main
 
 func f() { }
 `}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
 
 	for _, test := range []struct {
 		from, to string // values of the -offset/-from and -to flags
@@ -445,7 +466,7 @@ func f() { }
 			want: `-from "switch": invalid expression`,
 		},
 	} {
-		err := Main(ctxt, "", test.from, test.to)
+		err := Main(nil, "", test.from, test.to)
 		prefix := fmt.Sprintf("-from %q -to %q", test.from, test.to)
 		if err == nil {
 			t.Errorf("%s: expected error %q", prefix, test.want)
@@ -460,15 +481,15 @@ func TestRewrites(t *testing.T) {
 		writeFile = savedWriteFile
 	}(writeFile)
 
-	var ctxt *build.Context
-	for _, test := range []struct {
-		ctxt             *build.Context    // nil => use previous
-		offset, from, to string            // values of the -from/-offset and -to flags
-		want             map[string]string // contents of updated files
+	var ctxt map[string][]string
+	for i, test := range []struct {
+		ctxt             map[string][]string // nil => use previous
+		offset, from, to string              // values of the -from/-offset and -to flags
+		want             map[string]string   // contents of updated files
 	}{
 		// Elimination of renaming import.
 		{
-			ctxt: fakeContext(map[string][]string{
+			ctxt: map[string][]string{
 				"foo": {`package foo; type T int`},
 				"main": {`package main
 
@@ -476,7 +497,7 @@ import foo2 "foo"
 
 var _ foo2.T
 `},
-			}),
+			},
 			from: "main::foo2", to: "foo",
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -489,7 +510,7 @@ var _ foo.T
 		},
 		// Introduction of renaming import.
 		{
-			ctxt: fakeContext(map[string][]string{
+			ctxt: map[string][]string{
 				"foo": {`package foo; type T int`},
 				"main": {`package main
 
@@ -497,7 +518,7 @@ import "foo"
 
 var _ foo.T
 `},
-			}),
+			},
 			offset: "/go/src/main/0.go:#36", to: "foo2", // the "foo" in foo.T
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -512,12 +533,6 @@ var _ foo2.T
 		{
 			from: "foo.T", to: "U",
 			want: map[string]string{
-				"/go/src/main/0.go": `package main
-
-import "foo"
-
-var _ foo.U
-`,
 				"/go/src/foo/0.go": `package foo
 
 type U int
@@ -526,13 +541,14 @@ type U int
 		},
 		// Rename package-level func plus doc
 		{
-			ctxt: main(`package main
+			ctxt: map[string][]string{"main": {`package main
 
 // Foo is a no-op.
 // Calling Foo does nothing.
 func Foo() {
 }
-`),
+`},
+			},
 			from: "main.Foo", to: "FooBar",
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -546,14 +562,15 @@ func FooBar() {
 		},
 		// Rename method plus doc
 		{
-			ctxt: main(`package main
+			ctxt: map[string][]string{"main": {`package main
 
 type Foo struct{}
 
 // Bar does nothing.
 func (Foo) Bar() {
 }
-`),
+`},
+			},
 			from: "main.Foo.Bar", to: "Baz",
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -568,13 +585,14 @@ func (Foo) Baz() {
 		},
 		// Rename type spec plus doc
 		{
-			ctxt: main(`package main
+			ctxt: map[string][]string{"main": {`package main
 
 type (
 	// Test but not Testing.
 	Test struct{}
 )
-`),
+`},
+			},
 			from: "main.Test", to: "Type",
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -588,11 +606,11 @@ type (
 		},
 		// Rename type in gen decl plus doc
 		{
-			ctxt: main(`package main
+			ctxt: map[string][]string{"main": {`package main
 
 // T is a test type.
 type T struct{}
-`),
+`}},
 			from: "main.T", to: "Type",
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -604,13 +622,13 @@ type Type struct{}
 		},
 		// Rename value spec with doc
 		{
-			ctxt: main(`package main
+			ctxt: map[string][]string{"main": {`package main
 
 const (
 	// C is the speed of light.
 	C = 2.998e8
 )
-`),
+`}},
 			from: "main.C", to: "Lightspeed",
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -624,10 +642,10 @@ const (
 		},
 		// Rename value inside gen decl with doc
 		{
-			ctxt: main(`package main
+			ctxt: map[string][]string{"main": {`package main
 
 var out *string
-`),
+`}},
 			from: "main.out", to: "discard",
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -638,13 +656,13 @@ var discard *string
 		},
 		// Rename field plus doc
 		{
-			ctxt: main(`package main
+			ctxt: map[string][]string{"main": {`package main
 
 type Struct struct {
 	// Field is a struct field.
 	Field string
 }
-`),
+`}},
 			from: "main.Struct.Field", to: "Foo",
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -658,7 +676,7 @@ type Struct struct {
 		},
 		// Label renamings.
 		{
-			ctxt: main(`package main
+			ctxt: map[string][]string{"main": {`package main
 func f() {
 loop:
 	loop := 0
@@ -669,7 +687,7 @@ loop:
 	loop++
 	goto loop
 }
-`),
+`}},
 			offset: "/go/src/main/0.go:#25", to: "loop2", // def of outer label "loop"
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -707,13 +725,13 @@ loop:
 		},
 		// Renaming of type used as embedded field.
 		{
-			ctxt: main(`package main
+			ctxt: map[string][]string{"main": {`package main
 
 type T int
 type U struct { T }
 
 var _ = U{}.T
-`),
+`}},
 			from: "main.T", to: "T2",
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -727,13 +745,14 @@ var _ = U{}.T2
 		},
 		// Renaming of embedded field.
 		{
-			ctxt: main(`package main
+			ctxt: map[string][]string{"main": {`package main
 
 type T int
 type U struct { T }
 
 var _ = U{}.T
-`),
+`},
+			},
 			offset: "/go/src/main/0.go:#58", to: "T2", // T in "U{}.T"
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -747,13 +766,13 @@ var _ = U{}.T2
 		},
 		// Renaming of pointer embedded field.
 		{
-			ctxt: main(`package main
+			ctxt: map[string][]string{"main": {`package main
 
 type T int
 type U struct { *T }
 
 var _ = U{}.T
-`),
+`}},
 			offset: "/go/src/main/0.go:#59", to: "T2", // T in "U{}.T"
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -768,7 +787,7 @@ var _ = U{}.T2
 
 		// Lexical scope tests.
 		{
-			ctxt: main(`package main
+			ctxt: map[string][]string{"main": {`package main
 
 var y int
 
@@ -777,7 +796,7 @@ func f() {
 	y := ""
 	print(y)
 }
-`),
+`}},
 			from: "main.y", to: "x",
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -809,7 +828,7 @@ func f() {
 		},
 		// Renaming of typeswitch vars (a corner case).
 		{
-			ctxt: main(`package main
+			ctxt: map[string][]string{"main": {`package main
 
 func f(z interface{}) {
 	switch y := z.(type) {
@@ -819,7 +838,7 @@ func f(z interface{}) {
 		print(y)
 	}
 }
-`),
+`}},
 			offset: "/go/src/main/0.go:#46", to: "x", // def of y
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -867,85 +886,85 @@ func f(z interface{}) {
 
 		// Renaming of embedded field that is a qualified reference.
 		// (Regression test for bug 8924.)
-		{
-			ctxt: fakeContext(map[string][]string{
-				"foo": {`package foo; type T int`},
-				"main": {`package main
+		// 		{
+		// 			ctxt: map[string][]string{
+		// 				"foo": {`package foo; type T int`},
+		// 				"main": {`package main
 
-import "foo"
+		// import "foo"
 
-type _ struct{ *foo.T }
-`},
-			}),
-			offset: "/go/src/main/0.go:#48", to: "U", // the "T" in *foo.T
-			want: map[string]string{
-				"/go/src/foo/0.go": `package foo
+		// type _ struct{ *foo.T }
+		// `},
+		// 			},
+		// 			offset: "/go/src/main/0.go:#48", to: "U", // the "T" in *foo.T
+		// 			want: map[string]string{
+		// 				"/go/src/foo/0.go": `package foo
 
-type U int
-`,
-				"/go/src/main/0.go": `package main
+		// type U int
+		// `,
+		// 				"/go/src/main/0.go": `package main
 
-import "foo"
+		// import "foo"
 
-type _ struct{ *foo.U }
-`,
-			},
-		},
+		// type _ struct{ *foo.U }
+		// `,
+		// 			},
+		// 		},
 
 		// Renaming of embedded field that is a qualified reference with the '-from' flag.
 		// (Regression test for bug 12038.)
-		{
-			ctxt: fakeContext(map[string][]string{
-				"foo": {`package foo; type T int`},
-				"main": {`package main
+		// 		{
+		// 			ctxt: map[string][]string{
+		// 				"foo": {`package foo; type T int`},
+		// 				"main": {`package main
 
-import "foo"
+		// import "foo"
 
-type V struct{ *foo.T }
-`},
-			}),
-			from: "(main.V).T", to: "U", // the "T" in *foo.T
-			want: map[string]string{
-				"/go/src/foo/0.go": `package foo
+		// type V struct{ *foo.T }
+		// `},
+		// 			},
+		// 			from: "(main.V).T", to: "U", // the "T" in *foo.T
+		// 			want: map[string]string{
+		// 				"/go/src/foo/0.go": `package foo
 
-type U int
-`,
-				"/go/src/main/0.go": `package main
+		// type U int
+		// `,
+		// 				"/go/src/main/0.go": `package main
 
-import "foo"
+		// import "foo"
 
-type V struct{ *foo.U }
-`,
-			},
-		},
-		{
-			ctxt: fakeContext(map[string][]string{
-				"foo": {`package foo; type T int`},
-				"main": {`package main
+		// type V struct{ *foo.U }
+		// `,
+		// 			},
+		// 		},
+		// 		{
+		// 			ctxt: map[string][]string{
+		// 				"foo": {`package foo; type T int`},
+		// 				"main": {`package main
 
-import "foo"
+		// import "foo"
 
-type V struct{ foo.T }
-`},
-			}),
-			from: "(main.V).T", to: "U", // the "T" in *foo.T
-			want: map[string]string{
-				"/go/src/foo/0.go": `package foo
+		// type V struct{ foo.T }
+		// `},
+		// 			},
+		// 			from: "(main.V).T", to: "U", // the "T" in *foo.T
+		// 			want: map[string]string{
+		// 				"/go/src/foo/0.go": `package foo
 
-type U int
-`,
-				"/go/src/main/0.go": `package main
+		// type U int
+		// `,
+		// 				"/go/src/main/0.go": `package main
 
-import "foo"
+		// import "foo"
 
-type V struct{ foo.U }
-`,
-			},
-		},
+		// type V struct{ foo.U }
+		// `,
+		// 			},
+		// 		},
 
 		// Interface method renaming.
 		{
-			ctxt: fakeContext(map[string][]string{
+			ctxt: map[string][]string{
 				"main": {`
 package main
 type I interface {
@@ -964,7 +983,7 @@ var _, _ I = A(0), B(0)
 var _, _ J = B(0), C(0)
 `,
 				},
-			}),
+			},
 			offset: "/go/src/main/0.go:#34", to: "F", // abstract method I.f
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -1059,7 +1078,7 @@ var _, _ J = B(0), C(0)
 		},
 		// Indirect coupling of I.f to C.f from D->I assignment and anonymous field of D.
 		{
-			ctxt: fakeContext(map[string][]string{
+			ctxt: map[string][]string{
 				"main": {`
 package main
 type I interface {
@@ -1071,7 +1090,7 @@ type D struct{C}
 var _ I = D{}
 `,
 				},
-			}),
+			},
 			offset: "/go/src/main/0.go:#34", to: "F", // abstract method I.f
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -1091,7 +1110,7 @@ var _ I = D{}
 		},
 		// Interface embedded in struct.  No conflict if C need not satisfy I.
 		{
-			ctxt: fakeContext(map[string][]string{
+			ctxt: map[string][]string{
 				"main": {`
 package main
 type I interface {
@@ -1102,7 +1121,7 @@ func (C) g() int
 var _ int = C{}.g()
 `,
 				},
-			}),
+			},
 			offset: "/go/src/main/0.go:#34", to: "g", // abstract method I.f
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -1120,7 +1139,7 @@ var _ int = C{}.g()
 		},
 		// A type assertion causes method coupling iff signatures match.
 		{
-			ctxt: fakeContext(map[string][]string{
+			ctxt: map[string][]string{
 				"main": {`package main
 type I interface{
 	f()
@@ -1131,7 +1150,7 @@ type J interface{
 var _ = I(nil).(J)
 `,
 				},
-			}),
+			},
 			offset: "/go/src/main/0.go:#32", to: "g", // abstract method I.f
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -1149,7 +1168,7 @@ var _ = I(nil).(J)
 		},
 		// Impossible type assertion: no method coupling.
 		{
-			ctxt: fakeContext(map[string][]string{
+			ctxt: map[string][]string{
 				"main": {`package main
 type I interface{
 	f()
@@ -1160,7 +1179,7 @@ type J interface{
 var _ = I(nil).(J)
 `,
 				},
-			}),
+			},
 			offset: "/go/src/main/0.go:#32", to: "g", // abstract method I.f
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -1178,7 +1197,7 @@ var _ = I(nil).(J)
 		},
 		// Impossible type assertion: no method coupling C.f<->J.f.
 		{
-			ctxt: fakeContext(map[string][]string{
+			ctxt: map[string][]string{
 				"main": {`package main
 type I interface{
 	f()
@@ -1191,7 +1210,7 @@ type J interface{
 var _ = I(C(0)).(J)
 `,
 				},
-			}),
+			},
 			offset: "/go/src/main/0.go:#32", to: "g", // abstract method I.f
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -1213,7 +1232,7 @@ var _ = I(C(0)).(J)
 		},
 		// Progress after "soft" type errors (Go issue 14596).
 		{
-			ctxt: fakeContext(map[string][]string{
+			ctxt: map[string][]string{
 				"main": {`package main
 
 func main() {
@@ -1222,7 +1241,7 @@ func main() {
 }
 `,
 				},
-			}),
+			},
 			offset: "/go/src/main/0.go:#54", to: "y", // var x
 			want: map[string]string{
 				"/go/src/main/0.go": `package main
@@ -1235,22 +1254,40 @@ func main() {
 			},
 		},
 	} {
+
 		if test.ctxt != nil {
 			ctxt = test.ctxt
+		}
+		paths, cleanup, err := fakeContext(ctxt)
+		if err != nil {
+			log.Fatal(err)
 		}
 
 		got := make(map[string]string)
 		writeFile = func(filename string, content []byte) error {
-			got[filepath.ToSlash(filename)] = string(content)
-			return nil
+			for path, actual := range paths {
+				if actual == filename {
+					got[filepath.ToSlash(path)] = string(content)
+					return nil
+
+				}
+			}
+			return fmt.Errorf("can't write file %s", filename)
 		}
 
-		err := Main(ctxt, test.offset, test.from, test.to)
+		if strings.HasPrefix(test.offset, "/go/src") {
+			test.offset = strings.Replace(test.offset, "/go/src/", "./", 1)
+		}
+		if strings.HasPrefix(test.from, "/go/src") {
+			test.from = strings.Replace(test.from, "/go/src/", "./", 1)
+		}
+
+		err = Main(nil, test.offset, test.from, test.to)
 		var prefix string
 		if test.offset == "" {
-			prefix = fmt.Sprintf("-from %q -to %q", test.from, test.to)
+			prefix = fmt.Sprintf("%d: -from %q -to %q", i, test.from, test.to)
 		} else {
-			prefix = fmt.Sprintf("-offset %q -to %q", test.offset, test.to)
+			prefix = fmt.Sprintf("%d: -offset %q -to %q", i, test.offset, test.to)
 		}
 		if err != nil {
 			t.Errorf("%s: unexpected error: %s", prefix, err)
@@ -1273,6 +1310,7 @@ func main() {
 		for file := range got {
 			t.Errorf("%s: unexpected rewrite of file %s", prefix, file)
 		}
+		cleanup()
 	}
 }
 
@@ -1283,6 +1321,7 @@ func TestDiff(t *testing.T) {
 	if runtime.GOOS == "plan9" {
 		t.Skipf("plan9 diff tool doesn't support -u flag")
 	}
+	t.Skip("Diff in test files not supported in go1.10 or lower")
 
 	defer func() {
 		Diff = false
@@ -1291,7 +1330,7 @@ func TestDiff(t *testing.T) {
 	Diff = true
 	stdout = new(bytes.Buffer)
 
-	if err := Main(&build.Default, "", `"golang.org/x/tools/refactor/rename".justHereForTestingDiff`, "Foo"); err != nil {
+	if err := Main(nil, "", `"golang.org/x/tools/refactor/rename".justHereForTestingDiff`, "Foo"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1316,19 +1355,41 @@ func justHereForTestingDiff() {
 // Simplifying wrapper around buildutil.FakeContext for packages whose
 // filenames are sequentially numbered (%d.go).  pkgs maps a package
 // import path to its list of file contents.
-func fakeContext(pkgs map[string][]string) *build.Context {
-	pkgs2 := make(map[string]map[string]string)
-	for path, files := range pkgs {
-		filemap := make(map[string]string)
-		for i, contents := range files {
-			filemap[fmt.Sprintf("%d.go", i)] = contents
-		}
-		pkgs2[path] = filemap
-	}
-	return buildutil.FakeContext(pkgs2)
-}
+func fakeContext(pkgs map[string][]string) (map[string]string, func(), error) {
 
-// helper for single-file main packages with no imports.
-func main(content string) *build.Context {
-	return fakeContext(map[string][]string{"main": {content}})
+	// Set up fake gopath.
+	dir, _ := ioutil.TempDir("", "rename-")
+	testSrcDir := filepath.Join(dir, "src")
+	os.MkdirAll(testSrcDir, 0755)
+	os.Setenv("GOPATH", dir)
+	prefix := "/go/src/"
+
+	pkgs2 := make(map[string]string)
+	wd, _ := os.Getwd()
+	os.Chdir(testSrcDir)
+
+	var paths []string
+	for pkg, files := range pkgs {
+		path := filepath.Join(testSrcDir, pkg)
+		err := os.MkdirAll(path, 0755)
+		if err != nil {
+			return nil, nil, err
+		}
+		for i, contents := range files {
+			filename := filepath.Join(path, fmt.Sprintf("%d.go", i))
+			err := ioutil.WriteFile(filename, []byte(contents), 0666)
+			if err != nil {
+				return nil, nil, err
+			}
+			pkgs2[filepath.Join(prefix, pkg, fmt.Sprintf("%d.go", i))] = filename
+		}
+		paths = append(paths, path)
+	}
+	cleanup := func() {
+		os.Chdir(wd)
+		for _, path := range paths {
+			os.RemoveAll(path)
+		}
+	}
+	return pkgs2, cleanup, nil
 }

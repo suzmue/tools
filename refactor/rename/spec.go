@@ -12,7 +12,6 @@ import (
 	"bytes"
 	"fmt"
 	"go/ast"
-	"go/build"
 	"go/parser"
 	"go/token"
 	"go/types"
@@ -23,8 +22,8 @@ import (
 	"strconv"
 	"strings"
 
-	"golang.org/x/tools/go/buildutil"
-	"golang.org/x/tools/go/loader"
+	"golang.org/x/tools/go/ast/astutil"
+	"golang.org/x/tools/go/packages"
 )
 
 // A spec specifies an entity to rename.
@@ -69,7 +68,7 @@ type spec struct {
 
 // parseFromFlag interprets the "-from" flag value as a renaming specification.
 // See Usage in rename.go for valid formats.
-func parseFromFlag(ctxt *build.Context, fromFlag string) (*spec, error) {
+func parseFromFlag(fromFlag string) (*spec, error) {
 	var spec spec
 	var main string // sans "::x" suffix
 	switch parts := strings.Split(fromFlag, "::"); len(parts) {
@@ -91,16 +90,9 @@ func parseFromFlag(ctxt *build.Context, fromFlag string) (*spec, error) {
 			return nil, fmt.Errorf("-from: filename %q must have a ::name suffix", main)
 		}
 		spec.filename = main
-		if !buildutil.FileExists(ctxt, spec.filename) {
+		if _, err := os.Stat(spec.filename); err != nil {
 			return nil, fmt.Errorf("no such file: %s", spec.filename)
 		}
-
-		bp, err := buildutil.ContainingPackage(ctxt, wd, spec.filename)
-		if err != nil {
-			return nil, err
-		}
-		spec.pkg = bp.ImportPath
-
 	} else {
 		// main is one of:
 		//  "importpath"
@@ -114,18 +106,6 @@ func parseFromFlag(ctxt *build.Context, fromFlag string) (*spec, error) {
 	if spec.searchFor != "" {
 		spec.fromName = spec.searchFor
 	}
-
-	cwd, err := os.Getwd()
-	if err != nil {
-		return nil, err
-	}
-
-	// Sanitize the package.
-	bp, err := ctxt.Import(spec.pkg, cwd, build.FindOnly)
-	if err != nil {
-		return nil, fmt.Errorf("can't find package %q", spec.pkg)
-	}
-	spec.pkg = bp.ImportPath
 
 	if !isValidIdentifier(spec.fromName) {
 		return nil, fmt.Errorf("-from: invalid identifier %q", spec.fromName)
@@ -205,7 +185,7 @@ func parseImportPath(e ast.Expr) string {
 }
 
 // parseOffsetFlag interprets the "-offset" flag value as a renaming specification.
-func parseOffsetFlag(ctxt *build.Context, offsetFlag string) (*spec, error) {
+func parseOffsetFlag(offsetFlag string) (*spec, error) {
 	var spec spec
 	// Validate -offset, e.g. file.go:#123
 	parts := strings.Split(offsetFlag, ":#")
@@ -213,16 +193,8 @@ func parseOffsetFlag(ctxt *build.Context, offsetFlag string) (*spec, error) {
 		return nil, fmt.Errorf("-offset %q: invalid offset specification", offsetFlag)
 	}
 
+	var err error
 	spec.filename = parts[0]
-	if !buildutil.FileExists(ctxt, spec.filename) {
-		return nil, fmt.Errorf("no such file: %s", spec.filename)
-	}
-
-	bp, err := buildutil.ContainingPackage(ctxt, wd, spec.filename)
-	if err != nil {
-		return nil, err
-	}
-	spec.pkg = bp.ImportPath
 
 	for _, r := range parts[1] {
 		if !isDigit(r) {
@@ -236,7 +208,7 @@ func parseOffsetFlag(ctxt *build.Context, offsetFlag string) (*spec, error) {
 
 	// Parse the file and check there's an identifier at that offset.
 	fset := token.NewFileSet()
-	f, err := buildutil.ParseFile(fset, ctxt, nil, wd, spec.filename, parser.ParseComments)
+	f, err := parser.ParseFile(fset, spec.filename, nil, parser.ParseComments)
 	if err != nil {
 		return nil, fmt.Errorf("-offset %q: cannot parse file: %s", offsetFlag, err)
 	}
@@ -245,7 +217,6 @@ func parseOffsetFlag(ctxt *build.Context, offsetFlag string) (*spec, error) {
 	if id == nil {
 		return nil, fmt.Errorf("-offset %q: no identifier at this position", offsetFlag)
 	}
-
 	spec.fromName = id.Name
 
 	return &spec, nil
@@ -266,59 +237,43 @@ var wd = func() string {
 // copy of its library), so there may be multiple objects for
 // the same source entity.
 
-func findFromObjects(iprog *loader.Program, spec *spec) ([]types.Object, error) {
+func findFromObjects(pkgs []*packages.Package, spec *spec) ([]types.Object, error) {
 	if spec.filename != "" {
-		return findFromObjectsInFile(iprog, spec)
+		return findFromObjectsInFile(pkgs, spec)
 	}
 
 	// Search for objects defined in specified package.
-
-	// TODO(adonovan): the iprog.ImportMap has an entry {"main": ...}
-	// for main packages, even though that's not an import path.
-	// Seems like a bug.
-	//
-	// pkg := iprog.ImportMap[spec.pkg]
-	// if pkg == nil {
-	// 	return fmt.Errorf("cannot find package %s", spec.pkg) // can't happen?
-	// }
-	// info := iprog.AllPackages[pkg]
-
 	// Workaround: lookup by value.
-	var info *loader.PackageInfo
-	var pkg *types.Package
-	for pkg, info = range iprog.AllPackages {
-		if pkg.Path() == spec.pkg {
-			break
+	var res []types.Object
+	for _, pkg := range pkgs {
+		objects, err := findObjects(pkg, spec)
+		if err != nil {
+			continue
 		}
+		if len(objects) > 1 {
+			// ambiguous "*" scope query
+			return nil, ambiguityError(pkg.Fset, objects)
+		}
+		res = append(res, objects...)
 	}
-	if info == nil {
-		return nil, fmt.Errorf("package %q was not loaded", spec.pkg)
+	if len(res) == 0 {
+		return nil, fmt.Errorf("member not found")
 	}
-
-	objects, err := findObjects(info, spec)
-	if err != nil {
-		return nil, err
-	}
-	if len(objects) > 1 {
-		// ambiguous "*" scope query
-		return nil, ambiguityError(iprog.Fset, objects)
-	}
-	return objects, nil
+	return res, nil
 }
 
-func findFromObjectsInFile(iprog *loader.Program, spec *spec) ([]types.Object, error) {
+func findFromObjectsInFile(pkgs []*packages.Package, spec *spec) ([]types.Object, error) {
 	var fromObjects []types.Object
-	for _, info := range iprog.AllPackages {
+	for _, pkg := range pkgs {
 		// restrict to specified filename
 		// NB: under certain proprietary build systems, a given
 		// filename may appear in multiple packages.
-		for _, f := range info.Files {
-			thisFile := iprog.Fset.File(f.Pos())
-			if !sameFile(thisFile.Name(), spec.filename) {
+		for _, f := range pkg.Syntax {
+			thisFile := pkg.Fset.File(f.Pos())
+			if !sameFile(pkg.Fset.Position(f.Pos()).Filename, spec.filename) {
 				continue
 			}
 			// This package contains the query file.
-
 			if spec.offset != 0 {
 				// We cannot refactor generated files since position information is invalidated.
 				if generated(f, thisFile) {
@@ -326,20 +281,20 @@ func findFromObjectsInFile(iprog *loader.Program, spec *spec) ([]types.Object, e
 				}
 
 				// Search for a specific ident by file/offset.
-				id := identAtOffset(iprog.Fset, f, spec.offset)
+				id := identAtOffset(pkg.Fset, f, spec.offset)
 				if id == nil {
 					// can't happen?
 					return nil, fmt.Errorf("identifier not found")
 				}
-				obj := info.Uses[id]
+
+				obj := pkg.TypesInfo.Uses[id]
 				if obj == nil {
-					obj = info.Defs[id]
+					obj = pkg.TypesInfo.Defs[id]
 					if obj == nil {
 						// Ident without Object.
-
 						// Package clause?
 						pos := thisFile.Pos(spec.offset)
-						_, path, _ := iprog.PathEnclosingInterval(pos, pos)
+						_, path, _ := pathEnclosingInterval(pkg, pos, pos)
 						if len(path) == 2 { // [Ident File]
 							// TODO(adonovan): support this case.
 							return nil, fmt.Errorf("cannot rename %q: renaming package clauses is not yet supported",
@@ -347,8 +302,9 @@ func findFromObjectsInFile(iprog *loader.Program, spec *spec) ([]types.Object, e
 						}
 
 						// Implicit y in "switch y := x.(type) {"?
-						if obj := typeSwitchVar(&info.Info, path); obj != nil {
-							return []types.Object{obj}, nil
+						if obj := typeSwitchVar(pkg.TypesInfo, path); obj != nil {
+							fromObjects = []types.Object{obj}
+							break
 						}
 
 						// Probably a type error.
@@ -359,11 +315,10 @@ func findFromObjectsInFile(iprog *loader.Program, spec *spec) ([]types.Object, e
 					return nil, fmt.Errorf("cannot rename predeclared identifiers (%s)", obj)
 
 				}
-
 				fromObjects = append(fromObjects, obj)
 			} else {
 				// do a package-wide query
-				objects, err := findObjects(info, spec)
+				objects, err := findObjects(pkg, spec)
 				if err != nil {
 					return nil, err
 				}
@@ -371,7 +326,7 @@ func findFromObjectsInFile(iprog *loader.Program, spec *spec) ([]types.Object, e
 				// filter results: only objects defined in thisFile
 				var filtered []types.Object
 				for _, obj := range objects {
-					if iprog.Fset.File(obj.Pos()) == thisFile {
+					if pkg.Fset.File(obj.Pos()) == thisFile {
 						filtered = append(filtered, obj)
 					}
 				}
@@ -379,7 +334,7 @@ func findFromObjectsInFile(iprog *loader.Program, spec *spec) ([]types.Object, e
 					return nil, fmt.Errorf("no object %q declared in file %s",
 						spec.fromName, spec.filename)
 				} else if len(filtered) > 1 {
-					return nil, ambiguityError(iprog.Fset, filtered)
+					return nil, ambiguityError(pkg.Fset, filtered)
 				}
 				fromObjects = append(fromObjects, filtered[0])
 			}
@@ -387,9 +342,10 @@ func findFromObjectsInFile(iprog *loader.Program, spec *spec) ([]types.Object, e
 		}
 	}
 	if len(fromObjects) == 0 {
-		// can't happen?
-		return nil, fmt.Errorf("file %s was not part of the loaded program", spec.filename)
+		// can't happen.
+		return nil, fmt.Errorf("file %s was not part of the loaded programs", spec.filename)
 	}
+
 	return fromObjects, nil
 }
 
@@ -414,23 +370,23 @@ func typeSwitchVar(info *types.Info, path []ast.Node) types.Object {
 // one element unless spec.searchFor!="", in which case it has at least one
 // element.
 //
-func findObjects(info *loader.PackageInfo, spec *spec) ([]types.Object, error) {
+func findObjects(pkg *packages.Package, spec *spec) ([]types.Object, error) {
 	if spec.pkgMember == "" {
 		if spec.searchFor == "" {
 			panic(spec)
 		}
-		objects := searchDefs(&info.Info, spec.searchFor)
+		objects := searchDefs(pkg.TypesInfo, spec.searchFor)
 		if objects == nil {
 			return nil, fmt.Errorf("no object %q declared in package %q",
-				spec.searchFor, info.Pkg.Path())
+				spec.searchFor, pkg.Types.Path())
 		}
 		return objects, nil
 	}
 
-	pkgMember := info.Pkg.Scope().Lookup(spec.pkgMember)
+	pkgMember := pkg.Types.Scope().Lookup(spec.pkgMember)
 	if pkgMember == nil {
 		return nil, fmt.Errorf("package %q has no member %q",
-			info.Pkg.Path(), spec.pkgMember)
+			pkg.Types.Path(), spec.pkgMember)
 	}
 
 	var searchFunc *types.Func
@@ -454,14 +410,14 @@ func findObjects(info *loader.PackageInfo, spec *spec) ([]types.Object, error) {
 		tName, _ := pkgMember.(*types.TypeName)
 		if tName == nil {
 			return nil, fmt.Errorf("%s.%s is a %s, not a type",
-				info.Pkg.Path(), pkgMember.Name(), objectKind(pkgMember))
+				pkg.Types.Path(), pkgMember.Name(), objectKind(pkgMember))
 		}
 
 		// search within named type.
-		obj, _, _ := types.LookupFieldOrMethod(tName.Type(), true, info.Pkg, spec.typeMember)
+		obj, _, _ := types.LookupFieldOrMethod(tName.Type(), true, pkg.Types, spec.typeMember)
 		if obj == nil {
 			return nil, fmt.Errorf("cannot find field or method %q of %s %s.%s",
-				spec.typeMember, typeKind(tName.Type()), info.Pkg.Path(), tName.Name())
+				spec.typeMember, typeKind(tName.Type()), pkg.Types.Path(), tName.Name())
 		}
 
 		if spec.searchFor == "" {
@@ -480,24 +436,24 @@ func findObjects(info *loader.PackageInfo, spec *spec) ([]types.Object, error) {
 		searchFunc, _ = obj.(*types.Func)
 		if searchFunc == nil {
 			return nil, fmt.Errorf("cannot search for local name %q within %s (%s.%s).%s; need a function",
-				spec.searchFor, objectKind(obj), info.Pkg.Path(), tName.Name(),
+				spec.searchFor, objectKind(obj), pkg.Types.Path(), tName.Name(),
 				obj.Name())
 		}
 		if isInterface(tName.Type()) {
 			return nil, fmt.Errorf("cannot search for local name %q within abstract method (%s.%s).%s",
-				spec.searchFor, info.Pkg.Path(), tName.Name(), searchFunc.Name())
+				spec.searchFor, pkg.Types.Path(), tName.Name(), searchFunc.Name())
 		}
 	}
 
 	// -- search within function or method --
 
-	decl := funcDecl(info, searchFunc)
+	decl := funcDecl(pkg, searchFunc)
 	if decl == nil {
 		return nil, fmt.Errorf("cannot find syntax for %s", searchFunc) // can't happen?
 	}
 
 	var objects []types.Object
-	for _, obj := range searchDefs(&info.Info, spec.searchFor) {
+	for _, obj := range searchDefs(pkg.TypesInfo, spec.searchFor) {
 		// We use positions, not scopes, to determine whether
 		// the obj is within searchFunc.  This is clumsy, but the
 		// alternative, using the types.Scope tree, doesn't
@@ -514,10 +470,10 @@ func findObjects(info *loader.PackageInfo, spec *spec) ([]types.Object, error) {
 	return objects, nil
 }
 
-func funcDecl(info *loader.PackageInfo, fn *types.Func) *ast.FuncDecl {
-	for _, f := range info.Files {
+func funcDecl(pkg *packages.Package, fn *types.Func) *ast.FuncDecl {
+	for _, f := range pkg.Syntax {
 		for _, d := range f.Decls {
-			if d, ok := d.(*ast.FuncDecl); ok && info.Defs[d.Name] == fn {
+			if d, ok := d.(*ast.FuncDecl); ok && pkg.TypesInfo.Defs[d.Name] == fn {
 				return d
 			}
 		}
@@ -590,4 +546,46 @@ func generated(f *ast.File, tokenFile *token.File) bool {
 		}
 	}
 	return false
+}
+
+// pathEnclosingInterval returns the PackageInfo and ast.Node that
+// contain source interval [start, end), and all the node's ancestors
+// up to the AST root.  It searches all ast.Files of all packages in prog.
+// exact is defined as for astutil.PathEnclosingInterval.
+//
+// The zero value is returned if not found.
+//
+func pathEnclosingInterval(info *packages.Package, start, end token.Pos) (pkg *packages.Package, path []ast.Node, exact bool) {
+	var pkgs = []*packages.Package{info}
+	for _, imp := range info.Imports {
+		if imp == nil {
+			continue
+		}
+		pkgs = append(pkgs, imp)
+	}
+	for _, p := range pkgs {
+
+		for _, f := range info.Syntax {
+			if f.Pos() == token.NoPos {
+				// This can happen if the parser saw
+				// too many errors and bailed out.
+				// (Use parser.AllErrors to prevent that.)
+				continue
+			}
+			if !tokenFileContainsPos(p.Fset.File(f.Pos()), start) {
+				continue
+			}
+			if path, exact := astutil.PathEnclosingInterval(f, start, end); path != nil {
+				return info, path, exact
+			}
+		}
+	}
+	return nil, nil, false
+}
+
+// TODO(adonovan): make this a method: func (*token.File) Contains(token.Pos)
+func tokenFileContainsPos(f *token.File, pos token.Pos) bool {
+	p := int(pos)
+	base := f.Base()
+	return base <= p && p < base+f.Size()
 }
